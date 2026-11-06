@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""图片信息与编辑器 —— 重写第 1 部分。
+"""图片信息与编辑器 —— 重写第 2 部分。
 
-本阶段只实现：
-    * 打开并校验图片；
-    * 读取文件名、格式、宽高、颜色模式和文件大小；
+本阶段实现：
+    * 打开并校验图片，读取文件名、格式、宽高、颜色模式和文件大小；
     * 图片预览与基础错误提示；
-    * 为后续编辑功能预留界面框架。
+    * 等比/精确缩放；
+    * 顺时针 90°、180°、270° 旋转；
+    * 撤销与还原原图。
 
-缩放、裁剪、旋转、灰度、保存和格式转换将在后续分支中逐步补全。
+裁剪、灰度和导出功能将在后续分支中补全。
 
 运行：
     python image_editor.py
@@ -32,7 +33,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "图片信息与编辑器"
 APP_VERSION = "1.0"
-PART_LABEL = "PART 1 / 4"
+PART_LABEL = "PART 2 / 4"
 
 OPEN_FILETYPES = [
     ("常见图片", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff *.gif"),
@@ -57,6 +58,10 @@ MODE_LABELS = {
     "I": "I（32 位整数）",
     "F": "F（32 位浮点）",
 }
+
+# 防止误输入超大尺寸导致耗尽内存。
+MAX_IMAGE_SIDE = 12000
+MAX_IMAGE_PIXELS = 100_000_000
 
 # 界面配色
 BG = "#EEF2F7"
@@ -84,6 +89,10 @@ class ImageEditorError(Exception):
 
 class ImageLoadError(ImageEditorError):
     """文件不存在、无法读取或不是有效图片。"""
+
+
+class ValidationError(ImageEditorError):
+    """用户输入的参数不合法。"""
 
 
 @dataclass(frozen=True)
@@ -166,18 +175,151 @@ def load_image_file(path: str | os.PathLike[str]) -> Tuple[Image.Image, ImageInf
     return image, info
 
 
+def parse_positive_int(value: str, field_name: str) -> int:
+    """把界面文本解析为正整数，空值或非法值给出中文提示。"""
+    text = str(value).strip()
+    if not text:
+        raise ValidationError(f"请输入{field_name}。")
+    try:
+        number = int(text)
+    except ValueError as exc:
+        raise ValidationError(f"{field_name}必须是整数。") from exc
+    if number <= 0:
+        raise ValidationError(f"{field_name}必须大于 0。")
+    return number
+
+
+def parse_optional_positive_int(value: str, field_name: str) -> int | None:
+    """把界面文本解析为可空正整数；空值返回 None。"""
+    if not str(value).strip():
+        return None
+    return parse_positive_int(value, field_name)
+
+
+def parse_nonnegative_int(value: str, field_name: str) -> int:
+    """把界面文本解析为非负整数。"""
+    text = str(value).strip()
+    if not text:
+        raise ValidationError(f"请输入{field_name}。")
+    try:
+        number = int(text)
+    except ValueError as exc:
+        raise ValidationError(f"{field_name}必须是整数。") from exc
+    if number < 0:
+        raise ValidationError(f"{field_name}不能小于 0。")
+    return number
+
+
+def calculate_resize_dimensions(
+    original_width: int,
+    original_height: int,
+    width: int | None = None,
+    height: int | None = None,
+) -> Tuple[int, int]:
+    """只提供宽或高时按比例计算另一边，两者都提供时精确缩放。"""
+    if width is None and height is None:
+        raise ValidationError("请至少填写宽度或高度。")
+
+    for value, name in ((width, "宽度"), (height, "高度")):
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise ValidationError(f"{name}必须是大于 0 的整数。")
+
+    if width is None:
+        assert height is not None
+        new_width = max(1, int(round(original_width * height / original_height)))
+        new_height = height
+    elif height is None:
+        new_width = width
+        new_height = max(1, int(round(original_height * width / original_width)))
+    else:
+        new_width, new_height = width, height
+
+    if new_width > MAX_IMAGE_SIDE or new_height > MAX_IMAGE_SIDE:
+        raise ValidationError(
+            f"目标尺寸过大，单边不能超过 {MAX_IMAGE_SIDE} 像素。"
+        )
+    if new_width * new_height > MAX_IMAGE_PIXELS:
+        raise ValidationError("目标图片总像素过大，请减小缩放尺寸。")
+    return new_width, new_height
+
+
+def resize_image(
+    image: Image.Image,
+    width: int | None = None,
+    height: int | None = None,
+) -> Image.Image:
+    """按指定宽/高等比或精确缩放图片。"""
+    new_width, new_height = calculate_resize_dimensions(
+        image.width, image.height, width, height
+    )
+    if (new_width, new_height) == image.size:
+        return image.copy()
+    return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+
+def rotate_image(image: Image.Image, angle: int) -> Image.Image:
+    """顺时针旋转 90°、180° 或 270°。"""
+    if angle not in (90, 180, 270):
+        raise ValidationError("旋转角度只支持 90°、180° 或 270°。")
+    # Pillow 的 ROTATE_90 是逆时针；这里映射成顺时针角度。
+    operations = {
+        90: Image.Transpose.ROTATE_270,
+        180: Image.Transpose.ROTATE_180,
+        270: Image.Transpose.ROTATE_90,
+    }
+    return image.transpose(operations[angle])
+
+
 class ImageDocument:
-    """第 1 部分只保存当前图像和信息，编辑历史将在后续部分加入。"""
+    """保存原图、当前编辑结果以及可撤销的历史状态。"""
 
     def __init__(self, image: Image.Image, info: ImageInfo) -> None:
-        self.image = image
         self.info = info
         self.path = info.path
+        self._states = [("原图", image)]
+        self._index = 0
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> "ImageDocument":
         image, info = load_image_file(path)
         return cls(image, info)
+
+    @property
+    def image(self) -> Image.Image:
+        return self._states[self._index][1]
+
+    @property
+    def action_label(self) -> str:
+        return self._states[self._index][0]
+
+    @property
+    def can_undo(self) -> bool:
+        return self._index > 0
+
+    @property
+    def is_modified(self) -> bool:
+        return self._index > 0
+
+    def apply(self, image: Image.Image, label: str) -> None:
+        """提交一次编辑；之后的历史分支会被丢弃。"""
+        del self._states[self._index + 1 :]
+        self._states.append((label, image))
+        self._index += 1
+
+    def undo(self) -> str | None:
+        if not self.can_undo:
+            return None
+        undone_label = self._states[self._index][0]
+        self._index -= 1
+        return undone_label
+
+    def reset(self) -> bool:
+        if not self.is_modified:
+            return False
+        self._index = 0
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +364,7 @@ def make_app_icon() -> Image.Image:
 
 
 class ImageEditorApp(tk.Tk):
-    """第 1 部分主窗口。"""
+    """第 2 部分主窗口。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -240,6 +382,7 @@ class ImageEditorApp(tk.Tk):
         self._build_ui()
         self._bind_shortcuts()
         self._refresh_info()
+        self._refresh_action_states()
         self._center_window()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
         self.after(100, self._render_preview)
@@ -323,6 +466,57 @@ class ImageEditorApp(tk.Tk):
             background=[("pressed", ACCENT_DARK), ("active", ACCENT_DARK)],
             bordercolor=[("active", ACCENT_DARK)],
         )
+        style.configure(
+            "Secondary.TButton",
+            background="#F1F5F9",
+            foreground=TEXT,
+            bordercolor="#CBD5E1",
+            lightcolor="#CBD5E1",
+            darkcolor="#CBD5E1",
+            padding=(13, 7),
+            font=(family, 10),
+        )
+        style.map(
+            "Secondary.TButton",
+            background=[
+                ("disabled", "#F3F4F6"),
+                ("pressed", "#CBD5E1"),
+                ("active", "#E2E8F0"),
+            ],
+            foreground=[("disabled", "#94A3B8")],
+            bordercolor=[("disabled", BORDER)],
+        )
+        style.configure(
+            "Soft.TButton",
+            background=ACCENT_SOFT,
+            foreground=ACCENT_DARK,
+            bordercolor="#93C5FD",
+            lightcolor="#93C5FD",
+            darkcolor="#93C5FD",
+            padding=(13, 7),
+            font=(family, 10),
+        )
+        style.map(
+            "Soft.TButton",
+            background=[("pressed", "#BFDBFE"), ("active", "#BFDBFE")],
+            bordercolor=[("active", "#60A5FA")],
+        )
+        style.configure(
+            "TEntry",
+            fieldbackground=SURFACE,
+            foreground=TEXT,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            insertcolor=TEXT,
+            padding=(7, 6),
+        )
+        style.map(
+            "TEntry",
+            bordercolor=[("focus", ACCENT)],
+            lightcolor=[("focus", ACCENT)],
+            darkcolor=[("focus", ACCENT)],
+        )
 
         style.configure(
             "TNotebook",
@@ -388,7 +582,7 @@ class ImageEditorApp(tk.Tk):
         self.status_label.pack(side="left", padx=20, pady=6)
         tk.Label(
             status_bar,
-            text="Ctrl+O 打开图片",
+            text="Ctrl+O 打开    Ctrl+Z 撤销",
             bg=SURFACE,
             fg="#94A3B8",
             font=(self.font_family, 9),
@@ -428,7 +622,7 @@ class ImageEditorApp(tk.Tk):
         ).pack(anchor="w")
         tk.Label(
             title_box,
-            text="阶段 1 · 打开图片并读取基本信息",
+            text="阶段 2 · 图片信息、缩放与旋转",
             bg=SURFACE,
             fg=MUTED,
             font=(self.font_family, 9),
@@ -442,6 +636,20 @@ class ImageEditorApp(tk.Tk):
             command=self._on_open,
         )
         self.open_btn.pack(side="right", pady=18)
+        self.reset_btn = ttk.Button(
+            inner,
+            text="还原原图",
+            style="Secondary.TButton",
+            command=self._on_reset,
+        )
+        self.reset_btn.pack(side="right", padx=(0, 8), pady=18)
+        self.undo_btn = ttk.Button(
+            inner,
+            text="撤销",
+            style="Secondary.TButton",
+            command=self._on_undo,
+        )
+        self.undo_btn.pack(side="right", padx=(0, 8), pady=18)
         tk.Label(
             inner,
             text=PART_LABEL,
@@ -494,7 +702,7 @@ class ImageEditorApp(tk.Tk):
 
         tk.Label(
             card,
-            text="第 1 部分：读取文件信息并预览图片；编辑功能将在后续合并中加入。",
+            text="第 2 部分：已支持缩放与旋转；裁剪、灰度和导出将在后续合并中加入。",
             bg=SURFACE,
             fg="#94A3B8",
             font=(self.font_family, 9),
@@ -509,11 +717,17 @@ class ImageEditorApp(tk.Tk):
         self.notebook.pack(fill="both", expand=True)
 
         self.info_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
+        self.resize_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
+        self.rotate_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
         self.progress_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
         self.notebook.add(self.info_tab, text="图片信息")
+        self.notebook.add(self.resize_tab, text="缩放")
+        self.notebook.add(self.rotate_tab, text="旋转")
         self.notebook.add(self.progress_tab, text="开发进度")
 
         self._build_info_tab()
+        self._build_resize_tab()
+        self._build_rotate_tab()
         self._build_progress_tab()
         self.notebook.select(self.info_tab)
 
@@ -621,7 +835,7 @@ class ImageEditorApp(tk.Tk):
         ).pack(fill="x", pady=(4, 8))
 
         self.info_note_var = tk.StringVar(
-            value="当前阶段只读取信息，不会修改原图。"
+            value="打开图片后可进行等比缩放、精确缩放和旋转。"
         )
         tk.Label(
             tab,
@@ -633,6 +847,178 @@ class ImageEditorApp(tk.Tk):
             wraplength=330,
             anchor="w",
         ).pack(fill="x")
+
+    def _build_resize_tab(self) -> None:
+        tab = self.resize_tab
+        tk.Label(
+            tab,
+            text="按尺寸缩放",
+            bg=SURFACE,
+            fg=TEXT,
+            font=(self.font_family, 12, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            tab,
+            text="至少填写一项；只填宽度或高度时，另一项按原图比例自动计算。",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            justify="left",
+            wraplength=335,
+            anchor="w",
+        ).pack(fill="x", pady=(4, 10))
+
+        self.resize_current_var = tk.StringVar(value="当前图片：—")
+        tk.Label(
+            tab,
+            textvariable=self.resize_current_var,
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
+        form = tk.Frame(tab, bg=SURFACE)
+        form.pack(fill="x")
+        form.grid_columnconfigure(1, weight=1)
+
+        self.resize_width_var = tk.StringVar()
+        self.resize_height_var = tk.StringVar()
+        for row_index, (label, variable) in enumerate(
+            (("宽度", self.resize_width_var), ("高度", self.resize_height_var))
+        ):
+            tk.Label(
+                form,
+                text=label,
+                bg=SURFACE,
+                fg=TEXT,
+                font=(self.font_family, 9),
+                anchor="w",
+                width=6,
+            ).grid(row=row_index, column=0, sticky="w", pady=4)
+            ttk.Entry(
+                form, textvariable=variable, width=14, justify="right"
+            ).grid(row=row_index, column=1, sticky="we", padx=(0, 7), pady=4)
+            tk.Label(
+                form,
+                text="px",
+                bg=SURFACE,
+                fg=MUTED,
+                font=(self.font_family, 9),
+                width=2,
+                anchor="w",
+            ).grid(row=row_index, column=2, sticky="w", pady=4)
+
+        self.resize_info_label = tk.Label(
+            tab,
+            text="输出尺寸：请填写宽度或高度",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9, "bold"),
+            anchor="w",
+            justify="left",
+            wraplength=335,
+        )
+        self.resize_info_label.pack(fill="x", pady=(9, 10))
+        self.resize_width_var.trace_add("write", lambda *_: self._update_resize_hint())
+        self.resize_height_var.trace_add("write", lambda *_: self._update_resize_hint())
+
+        self.resize_btn = ttk.Button(
+            tab,
+            text="应用缩放",
+            style="Accent.TButton",
+            command=self._apply_resize,
+        )
+        self.resize_btn.pack(fill="x")
+
+        self._add_note_box(
+            tab,
+            "缩放说明",
+            "只填一边时按原比例缩放，两边都填时精确缩放。\n"
+            "放大不会增加真实细节，建议避免过度放大。",
+        )
+
+    def _build_rotate_tab(self) -> None:
+        tab = self.rotate_tab
+        tk.Label(
+            tab,
+            text="旋转图片",
+            bg=SURFACE,
+            fg=TEXT,
+            font=(self.font_family, 12, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            tab,
+            text="按顺时针方向旋转；90° 与 270° 会交换宽高，画质不受影响。",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            justify="left",
+            wraplength=335,
+            anchor="w",
+        ).pack(fill="x", pady=(4, 10))
+
+        self.rotate_current_var = tk.StringVar(value="当前图片：—")
+        tk.Label(
+            tab,
+            textvariable=self.rotate_current_var,
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 10))
+
+        rotate_row = tk.Frame(tab, bg=SURFACE)
+        rotate_row.pack(fill="x")
+        for column_index in range(3):
+            rotate_row.grid_columnconfigure(column_index, weight=1)
+
+        self.rotate_buttons = []
+        for index, angle in enumerate((90, 180, 270)):
+            button = ttk.Button(
+                rotate_row,
+                text=f"↻ {angle}°",
+                style="Soft.TButton",
+                command=lambda value=angle: self._rotate(value),
+            )
+            button.grid(
+                row=0,
+                column=index,
+                sticky="ew",
+                padx=(0, 6) if index < 2 else 0,
+            )
+            self.rotate_buttons.append(button)
+
+        self._add_note_box(
+            tab,
+            "无损操作",
+            "旋转使用无损转置，不会重新采样或损失画质。\n"
+            "可随时点击“撤销”，或使用“还原原图”恢复到打开时的状态。",
+        )
+
+    def _add_note_box(self, parent: tk.Widget, title: str, text: str) -> None:
+        box = tk.Frame(parent, bg=SURFACE_ALT, padx=11, pady=9)
+        box.pack(fill="x", pady=(18, 0))
+        tk.Label(
+            box,
+            text=title,
+            bg=SURFACE_ALT,
+            fg=ACCENT_DARK,
+            font=(self.font_family, 9, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            box,
+            text=text,
+            bg=SURFACE_ALT,
+            fg=MUTED,
+            font=(self.font_family, 8),
+            justify="left",
+            anchor="w",
+            wraplength=315,
+        ).pack(fill="x", pady=(4, 0))
 
     def _build_progress_tab(self) -> None:
         tab = self.progress_tab
@@ -658,7 +1044,7 @@ class ImageEditorApp(tk.Tk):
         items = [
             ("已完成", "打开图片与错误处理", True),
             ("已完成", "文件名 / 格式 / 宽高 / 颜色模式 / 大小", True),
-            ("待实现", "缩放、旋转与撤销", False),
+            ("已完成", "缩放、旋转、撤销与还原", True),
             ("待实现", "裁剪、灰度与透明通道", False),
             ("待实现", "格式转换、原图保护与完整测试", False),
         ]
@@ -698,8 +1084,8 @@ class ImageEditorApp(tk.Tk):
         tk.Label(
             note,
             text=(
-                "这是重写计划的第 1 部分，只包含图片加载与信息展示。\n"
-                "后续分支会依次补全编辑能力，最后通过 Git 合并并运行完整测试。"
+                "这是重写计划的第 2 部分，已包含图片加载、缩放、旋转与撤销。\n"
+                "后续分支会补全裁剪、灰度、格式转换，最后通过 Git 合并。"
             ),
             bg=SURFACE_ALT,
             fg=MUTED,
@@ -711,6 +1097,7 @@ class ImageEditorApp(tk.Tk):
 
     def _bind_shortcuts(self) -> None:
         self.bind("<Control-o>", lambda _event: self._shortcut(self._on_open))
+        self.bind("<Control-z>", lambda _event: self._shortcut(self._on_undo))
 
     @staticmethod
     def _shortcut(callback) -> str:
@@ -741,27 +1128,177 @@ class ImageEditorApp(tk.Tk):
             self.info_state_var.set("未打开")
             self.info_state_badge.configure(bg=SURFACE_ALT, fg=MUTED)
             self.info_path_var.set("—")
-            self.info_note_var.set("当前阶段只读取信息，不会修改原图。")
+            self.info_note_var.set("打开图片后可进行等比缩放、精确缩放和旋转。")
             self.preview_badge_var.set("未打开图片")
+            self.resize_current_var.set("当前图片：—")
+            self.rotate_current_var.set("当前图片：—")
+            self._update_resize_hint()
             return
 
         info = doc.info
+        image = doc.image
         self.info_vars["filename"].set(info.filename)
         self.info_vars["format"].set(info.image_format)
-        self.info_vars["width"].set(f"{info.width} px")
-        self.info_vars["height"].set(f"{info.height} px")
-        self.info_vars["mode"].set(describe_mode(info.mode))
+        self.info_vars["width"].set(f"{image.width} px")
+        self.info_vars["height"].set(f"{image.height} px")
+        self.info_vars["mode"].set(describe_mode(image.mode))
         self.info_vars["size"].set(info.file_size_mb)
         self.info_path_var.set(str(info.path))
-        self.info_state_var.set("原图")
-        self.info_state_badge.configure(bg=SURFACE_ALT, fg=MUTED)
+        if doc.is_modified:
+            self.info_state_var.set(f"已编辑 · {doc.action_label}")
+            self.info_state_badge.configure(bg=ACCENT_SOFT, fg=ACCENT_DARK)
+        else:
+            self.info_state_var.set("原图")
+            self.info_state_badge.configure(bg=SURFACE_ALT, fg=MUTED)
         self.info_note_var.set(
             f"原图尺寸：{info.width} × {info.height} 像素；"
-            "编辑功能将在后续部分加入。"
+            "文件大小为原图大小，宽高和颜色模式显示当前结果。"
         )
         self.preview_badge_var.set(
-            f"原图 · {info.width} × {info.height} px · {info.mode}"
+            f"{doc.action_label} · {image.width} × {image.height} px · {image.mode}"
         )
+        self.resize_current_var.set(f"当前图片：{image.width} × {image.height} px")
+        self.rotate_current_var.set(f"当前图片：{image.width} × {image.height} px")
+        self._update_resize_hint()
+
+    def _refresh_action_states(self) -> None:
+        doc = self.document
+        state = "normal" if doc is not None else "disabled"
+        for button in (self.resize_btn, *self.rotate_buttons):
+            button.configure(state=state)
+        self.undo_btn.configure(
+            state="normal" if doc is not None and doc.can_undo else "disabled"
+        )
+        self.reset_btn.configure(
+            state="normal" if doc is not None and doc.is_modified else "disabled"
+        )
+
+    def _update_resize_hint(self) -> None:
+        if not hasattr(self, "resize_info_label"):
+            return
+        doc = self.document
+        if doc is None:
+            self.resize_info_label.configure(text="输出尺寸：—", fg=MUTED)
+            return
+        try:
+            width = parse_optional_positive_int(self.resize_width_var.get(), "宽度")
+            height = parse_optional_positive_int(self.resize_height_var.get(), "高度")
+            if width is None and height is None:
+                self.resize_info_label.configure(
+                    text="输出尺寸：请填写宽度或高度", fg=MUTED
+                )
+                return
+            new_width, new_height = calculate_resize_dimensions(
+                doc.image.width, doc.image.height, width, height
+            )
+            suffix = "（等比）" if (width is None or height is None) else ""
+            self.resize_info_label.configure(
+                text=f"输出尺寸：{new_width} × {new_height} px {suffix}",
+                fg=ACCENT,
+            )
+        except ValidationError as exc:
+            self.resize_info_label.configure(text=str(exc), fg=DANGER)
+
+    def _reset_fields_for_document(self) -> None:
+        self.resize_width_var.set("")
+        self.resize_height_var.set("")
+        self._update_resize_hint()
+
+    def _commit_edit(self, new_image: Image.Image, label: str, message: str) -> None:
+        doc = self.document
+        if doc is None:
+            return
+        doc.apply(new_image, label)
+        self._reset_fields_for_document()
+        self._refresh_info()
+        self._refresh_action_states()
+        self._render_preview()
+        self._set_status(message, "success")
+
+    def _show_validation(self, exc: Exception, title: str = "参数错误") -> None:
+        messagebox.showerror(title, str(exc), parent=self)
+        self._set_status(str(exc).splitlines()[0], "error")
+
+    def _apply_resize(self) -> None:
+        doc = self.document
+        if doc is None:
+            return
+        try:
+            width = parse_optional_positive_int(self.resize_width_var.get(), "宽度")
+            height = parse_optional_positive_int(self.resize_height_var.get(), "高度")
+            if width is None and height is None:
+                raise ValidationError("请至少填写宽度或高度。")
+            old_width, old_height = doc.image.size
+            new_image = resize_image(doc.image, width, height)
+        except ValidationError as exc:
+            self._show_validation(exc)
+            return
+        except Exception as exc:
+            messagebox.showerror("缩放失败", f"无法完成缩放：\n{exc}", parent=self)
+            self._set_status("缩放失败。", "error")
+            return
+
+        label = "等比缩放" if (width is None or height is None) else "精确缩放"
+        self._commit_edit(
+            new_image,
+            label,
+            f"{label}完成：{old_width} × {old_height} → "
+            f"{new_image.width} × {new_image.height} 像素",
+        )
+
+    def _rotate(self, angle: int) -> None:
+        doc = self.document
+        if doc is None:
+            return
+        try:
+            old_size = doc.image.size
+            new_image = rotate_image(doc.image, angle)
+        except ValidationError as exc:
+            self._show_validation(exc)
+            return
+        except Exception as exc:
+            messagebox.showerror("旋转失败", f"无法完成旋转：\n{exc}", parent=self)
+            self._set_status("旋转失败。", "error")
+            return
+
+        self._commit_edit(
+            new_image,
+            f"旋转 {angle}°",
+            f"旋转完成：{old_size[0]} × {old_size[1]} → "
+            f"{new_image.width} × {new_image.height} 像素",
+        )
+
+    def _on_undo(self) -> None:
+        doc = self.document
+        if doc is None or not doc.can_undo:
+            return
+        undone = doc.undo()
+        self._reset_fields_for_document()
+        self._refresh_info()
+        self._refresh_action_states()
+        self._render_preview()
+        self._set_status(
+            f"已撤销：{undone or '上一步'}。当前：{doc.action_label}。",
+            "success",
+        )
+
+    def _on_reset(self) -> None:
+        doc = self.document
+        if doc is None or not doc.is_modified:
+            return
+        if not messagebox.askyesno(
+            "还原原图",
+            "确定放弃当前所有编辑，恢复到打开时的原图吗？",
+            icon="warning",
+            parent=self,
+        ):
+            return
+        doc.reset()
+        self._reset_fields_for_document()
+        self._refresh_info()
+        self._refresh_action_states()
+        self._render_preview()
+        self._set_status("已还原为原图。", "success")
 
     def _set_status(self, text: str, kind: str = "info") -> None:
         colors = {"info": MUTED, "success": SUCCESS, "error": DANGER}
@@ -796,7 +1333,9 @@ class ImageEditorApp(tk.Tk):
 
         self.document = document
         self.title(f"{APP_TITLE} · {document.info.filename}")
+        self._reset_fields_for_document()
         self._refresh_info()
+        self._refresh_action_states()
         self.notebook.select(self.info_tab)
         self._render_preview()
         self._set_status(
