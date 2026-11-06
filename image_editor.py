@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""图片信息与编辑器 —— 重写第 3 部分。
+"""图片信息与简单编辑器（Tkinter + Pillow）。
 
-本阶段实现：
-    * 打开并校验图片，读取文件名、格式、宽高、颜色模式和文件大小；
-    * 图片预览与基础错误提示；
-    * 等比/精确缩放，90°、180°、270° 旋转，撤销与还原；
-    * 指定坐标裁剪、预览图拖动框选和越界提示；
-    * 彩色转灰度，并保留透明通道。
-
-保存、格式转换和原图保护将在第 4 部分补全。
+功能：
+    * 读取文件名、格式、宽高、颜色模式和文件大小；
+    * 等比/精确缩放、区域裁剪、90°/180°/270° 旋转；
+    * 彩色转灰度并保留透明通道；
+    * PNG、JPG、WebP、BMP、TIFF 格式转换；
+    * 只允许另存为新文件，禁止覆盖原图；
+    * 文件不存在、无效图片、参数错误和保存失败均有友好提示。
 
 运行：
     python image_editor.py
@@ -20,6 +19,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+import tempfile
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -34,7 +34,6 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "图片信息与编辑器"
 APP_VERSION = "1.0"
-PART_LABEL = "PART 3 / 4"
 
 OPEN_FILETYPES = [
     ("常见图片", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff *.gif"),
@@ -63,6 +62,53 @@ MODE_LABELS = {
 # 防止误输入超大尺寸导致耗尽内存。
 MAX_IMAGE_SIDE = 12000
 MAX_IMAGE_PIXELS = 100_000_000
+
+# 保存格式：界面名称 -> 扩展名 / 可选后缀 / 文件类型过滤器
+EXPORT_FORMATS = {
+    "PNG": {
+        "suffix": ".png",
+        "suffixes": (".png",),
+        "filetype": ("PNG 图片", "*.png"),
+    },
+    "JPG": {
+        "suffix": ".jpg",
+        "suffixes": (".jpg", ".jpeg"),
+        "filetype": ("JPEG 图片", "*.jpg *.jpeg"),
+    },
+    "WebP": {
+        "suffix": ".webp",
+        "suffixes": (".webp",),
+        "filetype": ("WebP 图片", "*.webp"),
+    },
+    "BMP": {
+        "suffix": ".bmp",
+        "suffixes": (".bmp",),
+        "filetype": ("BMP 图片", "*.bmp"),
+    },
+    "TIFF": {
+        "suffix": ".tif",
+        "suffixes": (".tif", ".tiff"),
+        "filetype": ("TIFF 图片", "*.tif *.tiff"),
+    },
+}
+EXPORT_FORMAT_NAMES = tuple(EXPORT_FORMATS)
+SOURCE_FORMAT_TO_EXPORT = {
+    "PNG": "PNG",
+    "JPEG": "JPG",
+    "WEBP": "WebP",
+    "BMP": "BMP",
+    "TIFF": "TIFF",
+}
+
+SUFFIX_FORMATS = {
+    ".png": "PNG",
+    ".jpg": "JPEG",
+    ".jpeg": "JPEG",
+    ".webp": "WEBP",
+    ".bmp": "BMP",
+    ".tif": "TIFF",
+    ".tiff": "TIFF",
+}
 
 # 界面配色
 BG = "#EEF2F7"
@@ -98,6 +144,10 @@ class ValidationError(ImageEditorError):
 
 class CropOutOfBoundsError(ValidationError):
     """裁剪区域超出图片边界。"""
+
+
+class ImageSaveError(ImageEditorError):
+    """保存图片失败。"""
 
 
 @dataclass(frozen=True)
@@ -316,6 +366,126 @@ def to_grayscale(image: Image.Image) -> Image.Image:
         raise ValidationError(f"无法转换为灰度图：{exc}") from exc
 
 
+def _flatten_on_white(image: Image.Image) -> Image.Image:
+    """把透明图片合成到白底，避免保存 JPG 时透明区域变黑。"""
+    rgba = image.convert("RGBA")
+    background = Image.new("RGB", rgba.size, (255, 255, 255))
+    background.paste(rgba, mask=rgba.getchannel("A"))
+    return background
+
+
+def _prepare_for_format(image: Image.Image, image_format: str) -> Image.Image:
+    """根据目标格式移除该格式不支持的通道/模式。"""
+    fmt = image_format.upper()
+
+    if fmt == "JPEG":
+        # JPEG 不支持透明通道，必须先将透明区域合成到白色背景。
+        if has_alpha(image) or image.mode not in ("RGB", "L", "CMYK"):
+            flattened = _flatten_on_white(image)
+            # 灰度+透明的图片保存为 JPG 时仍保持灰度模式。
+            if image.mode in ("LA", "1"):
+                return flattened.convert("L")
+            return flattened
+        return image.copy()
+
+    if fmt == "PNG":
+        if image.mode in ("CMYK", "YCbCr"):
+            return image.convert("RGB")
+        return image.copy()
+
+    if fmt == "WEBP":
+        if image.mode in ("RGB", "RGBA", "L", "LA"):
+            return image.copy()
+        return image.convert("RGBA" if has_alpha(image) else "RGB")
+
+    if fmt == "BMP":
+        if image.mode not in ("1", "L", "P", "RGB", "RGBA"):
+            return image.convert("RGBA" if has_alpha(image) else "RGB")
+        return image.copy()
+
+    return image.copy()
+
+
+def paths_are_same(
+    first: str | os.PathLike[str], second: str | os.PathLike[str]
+) -> bool:
+    """尽量可靠地判断两个路径是否指向同一个文件。"""
+    try:
+        if Path(first).exists() and Path(second).exists():
+            return os.path.samefile(first, second)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(str(first))) == os.path.normcase(
+        os.path.abspath(str(second))
+    )
+
+
+def save_image(
+    image: Image.Image,
+    target_path: str | os.PathLike[str],
+    source_path: str | os.PathLike[str] | None = None,
+) -> Path:
+    """按扩展名转换格式并另存；禁止覆盖原图。"""
+    target = Path(target_path).expanduser()
+    suffix = target.suffix.lower()
+    image_format = SUFFIX_FORMATS.get(suffix)
+
+    if not suffix:
+        raise ValidationError(
+            "保存文件名缺少扩展名。\n"
+            "请使用 .png、.jpg、.jpeg、.webp、.bmp、.tif 等扩展名。"
+        )
+    if image_format is None:
+        raise ValidationError(
+            f"不支持保存为“{suffix}”格式。\n"
+            "支持：PNG、JPG/JPEG、WebP、BMP、TIFF。"
+        )
+    if source_path is not None and paths_are_same(target, source_path):
+        raise ValidationError(
+            "为了保护原图，编辑结果不能保存到原文件。\n"
+            "请换一个文件名或保存位置。"
+        )
+    if not target.parent.exists():
+        raise ValidationError(f"保存目录不存在：\n{target.parent}")
+    if not target.parent.is_dir():
+        raise ValidationError(f"保存位置不是文件夹：\n{target.parent}")
+
+    try:
+        prepared = _prepare_for_format(image, image_format)
+        params = {}
+        if image_format == "JPEG":
+            params = {"quality": 95, "optimize": True, "progressive": True}
+        elif image_format == "WEBP":
+            params = {"quality": 95, "method": 4}
+        elif image_format == "PNG":
+            params = {"optimize": True}
+        elif image_format == "TIFF":
+            params = {"compression": "tiff_lzw"}
+
+        # 先写同目录临时文件，成功后再替换，避免留下半成品。
+        fd, temp_name = tempfile.mkstemp(
+            prefix=".image_editor_", suffix=suffix, dir=str(target.parent)
+        )
+        os.close(fd)
+        try:
+            prepared.save(temp_name, format=image_format, **params)
+            os.replace(temp_name, target)
+        finally:
+            if os.path.exists(temp_name):
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+    except ValidationError:
+        raise
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ImageSaveError(f"保存图片失败：{exc}") from exc
+
+    if not target.exists() or target.stat().st_size == 0:
+        raise ImageSaveError("保存操作未生成有效的图片文件，请检查保存位置和权限。")
+    return target.resolve()
+
+
 class ImageDocument:
     """保存原图、当前编辑结果以及可撤销的历史状态。"""
 
@@ -324,6 +494,7 @@ class ImageDocument:
         self.path = info.path
         self._states = [("原图", image)]
         self._index = 0
+        self._saved_index = 0
 
     @classmethod
     def from_file(cls, path: str | os.PathLike[str]) -> "ImageDocument":
@@ -346,6 +517,10 @@ class ImageDocument:
     def is_modified(self) -> bool:
         return self._index > 0
 
+    @property
+    def has_unsaved_changes(self) -> bool:
+        return self._index != self._saved_index
+
     def apply(self, image: Image.Image, label: str) -> None:
         """提交一次编辑；之后的历史分支会被丢弃。"""
         del self._states[self._index + 1 :]
@@ -364,6 +539,9 @@ class ImageDocument:
             return False
         self._index = 0
         return True
+
+    def mark_saved(self) -> None:
+        self._saved_index = self._index
 
 
 # ---------------------------------------------------------------------------
@@ -408,7 +586,7 @@ def make_app_icon() -> Image.Image:
 
 
 class ImageEditorApp(tk.Tk):
-    """第 3 部分主窗口。"""
+    """主窗口。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -431,7 +609,7 @@ class ImageEditorApp(tk.Tk):
         self._refresh_info()
         self._refresh_action_states()
         self._center_window()
-        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(100, self._render_preview)
 
     # ----- 初始化 ---------------------------------------------------------
@@ -564,6 +742,25 @@ class ImageEditorApp(tk.Tk):
             lightcolor=[("focus", ACCENT)],
             darkcolor=[("focus", ACCENT)],
         )
+        style.configure(
+            "TCombobox",
+            fieldbackground=SURFACE,
+            background=SURFACE,
+            foreground=TEXT,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            arrowcolor=TEXT,
+            padding=(7, 5),
+        )
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", SURFACE), ("disabled", "#F3F4F6")],
+            foreground=[("readonly", TEXT), ("disabled", "#94A3B8")],
+            selectbackground=[("readonly", SURFACE)],
+            selectforeground=[("readonly", TEXT)],
+            bordercolor=[("focus", ACCENT)],
+        )
 
         style.configure(
             "TNotebook",
@@ -603,8 +800,13 @@ class ImageEditorApp(tk.Tk):
     def _center_window(self) -> None:
         screen_w = self.winfo_screenwidth()
         screen_h = self.winfo_screenheight()
-        width = min(1200, max(980, screen_w - 120))
-        height = min(800, max(680, screen_h - 120))
+        self.update_idletasks()
+        width = min(1240, max(980, screen_w - 100))
+        required_height = self.winfo_reqheight()
+        height = min(
+            max(830, required_height + 4),
+            max(620, screen_h - 80),
+        )
         x = max(0, (screen_w - width) // 2)
         y = max(0, (screen_h - height) // 3)
         self.geometry(f"{width}x{height}+{x}+{y}")
@@ -629,7 +831,7 @@ class ImageEditorApp(tk.Tk):
         self.status_label.pack(side="left", padx=20, pady=6)
         tk.Label(
             status_bar,
-            text="Ctrl+O 打开    Ctrl+Z 撤销",
+            text="Ctrl+O 打开    Ctrl+S 另存为    Ctrl+Z 撤销",
             bg=SURFACE,
             fg="#94A3B8",
             font=(self.font_family, 9),
@@ -669,7 +871,7 @@ class ImageEditorApp(tk.Tk):
         ).pack(anchor="w")
         tk.Label(
             title_box,
-            text="阶段 3 · 裁剪、灰度与透明通道",
+            text="查看信息 · 缩放 · 裁剪 · 旋转 · 灰度 · 格式转换",
             bg=SURFACE,
             fg=MUTED,
             font=(self.font_family, 9),
@@ -697,15 +899,6 @@ class ImageEditorApp(tk.Tk):
             command=self._on_undo,
         )
         self.undo_btn.pack(side="right", padx=(0, 8), pady=18)
-        tk.Label(
-            inner,
-            text=PART_LABEL,
-            bg=ACCENT_SOFT,
-            fg=ACCENT_DARK,
-            font=(self.font_family, 8, "bold"),
-            padx=9,
-            pady=4,
-        ).pack(side="right", padx=(0, 12), pady=20)
 
     def _build_preview(self, parent: tk.Widget) -> None:
         card = tk.Frame(
@@ -752,7 +945,7 @@ class ImageEditorApp(tk.Tk):
 
         tk.Label(
             card,
-            text="第 3 部分：已支持缩放、旋转、裁剪与灰度；格式转换将在第 4 部分加入。",
+            text="提示：可直接在左侧预览图上拖动鼠标框选裁剪区域",
             bg=SURFACE,
             fg="#94A3B8",
             font=(self.font_family, 9),
@@ -763,6 +956,7 @@ class ImageEditorApp(tk.Tk):
         side = tk.Frame(parent, bg=BG)
         side.grid(row=0, column=1, sticky="nsew")
 
+        self._build_save_card(side)
         self.notebook = ttk.Notebook(side)
         self.notebook.pack(fill="both", expand=True)
 
@@ -1212,8 +1406,62 @@ class ImageEditorApp(tk.Tk):
             wraplength=315,
         ).pack(fill="x", pady=(4, 0))
 
+    def _build_save_card(self, parent: tk.Widget) -> None:
+        card = tk.Frame(
+            parent, bg=SURFACE, highlightbackground=BORDER, highlightthickness=1
+        )
+        card.pack(side="bottom", fill="x", pady=(12, 0))
+
+        tk.Label(
+            card,
+            text="导出 / 格式转换",
+            bg=SURFACE,
+            fg=TEXT,
+            font=(self.font_family, 11, "bold"),
+            anchor="w",
+        ).pack(fill="x", padx=15, pady=(11, 3))
+        tk.Label(
+            card,
+            text="先选择输出格式，再另存为新文件；原图不会被覆盖。",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 8),
+            justify="left",
+            anchor="w",
+        ).pack(fill="x", padx=15)
+
+        format_row = tk.Frame(card, bg=SURFACE)
+        format_row.pack(fill="x", padx=15, pady=(8, 0))
+        tk.Label(
+            format_row,
+            text="输出格式",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            anchor="w",
+        ).pack(side="left")
+        self.export_format_var = tk.StringVar(value="PNG")
+        self.export_combo = ttk.Combobox(
+            format_row,
+            textvariable=self.export_format_var,
+            values=EXPORT_FORMAT_NAMES,
+            state="readonly",
+            width=9,
+            justify="left",
+        )
+        self.export_combo.pack(side="right")
+
+        self.save_btn = ttk.Button(
+            card,
+            text="另存为新文件…",
+            style="Accent.TButton",
+            command=self._on_save,
+        )
+        self.save_btn.pack(fill="x", padx=15, pady=(8, 12))
+
     def _bind_shortcuts(self) -> None:
         self.bind("<Control-o>", lambda _event: self._shortcut(self._on_open))
+        self.bind("<Control-s>", lambda _event: self._shortcut(self._on_save))
         self.bind("<Control-z>", lambda _event: self._shortcut(self._on_undo))
 
     @staticmethod
@@ -1290,6 +1538,7 @@ class ImageEditorApp(tk.Tk):
             self.crop_btn,
             self.crop_all_btn,
             self.grayscale_btn,
+            self.save_btn,
             *self.rotate_buttons,
         ):
             button.configure(state=state)
@@ -1299,6 +1548,7 @@ class ImageEditorApp(tk.Tk):
         self.reset_btn.configure(
             state="normal" if doc is not None and doc.is_modified else "disabled"
         )
+        self.export_combo.configure(state="readonly" if doc is not None else "disabled")
         self.canvas.configure(cursor="crosshair" if doc is not None else "")
 
     def _update_resize_hint(self) -> None:
@@ -1543,9 +1793,21 @@ class ImageEditorApp(tk.Tk):
         self.status_var.set(text)
         self.status_label.configure(fg=colors.get(kind, MUTED))
 
-    # ----- 打开图片 -------------------------------------------------------
+    # ----- 打开与保存 -----------------------------------------------------
+
+    def _confirm_discard(self) -> bool:
+        if self.document is not None and self.document.has_unsaved_changes:
+            return messagebox.askyesno(
+                "有未保存的修改",
+                "当前编辑结果尚未另存为新文件。\n继续操作将丢失这些修改，是否继续？",
+                icon="warning",
+                parent=self,
+            )
+        return True
 
     def _on_open(self) -> None:
+        if not self._confirm_discard():
+            return
         path = filedialog.askopenfilename(
             title="打开图片",
             filetypes=OPEN_FILETYPES,
@@ -1570,6 +1832,9 @@ class ImageEditorApp(tk.Tk):
             return
 
         self.document = document
+        self.export_format_var.set(
+            SOURCE_FORMAT_TO_EXPORT.get(document.info.image_format, "PNG")
+        )
         self.title(f"{APP_TITLE} · {document.info.filename}")
         self._reset_fields_for_document()
         self._refresh_info()
@@ -1581,6 +1846,68 @@ class ImageEditorApp(tk.Tk):
             f"{describe_mode(document.info.mode)}）",
             "success",
         )
+
+    def _on_save(self) -> None:
+        doc = self.document
+        if doc is None:
+            return
+
+        format_name = self.export_format_var.get()
+        config = EXPORT_FORMATS.get(format_name, EXPORT_FORMATS["PNG"])
+        suffix = config["suffix"]
+        initial_name = f"{doc.path.stem}_edited{suffix}"
+
+        path = filedialog.asksaveasfilename(
+            title=f"另存为 {format_name} 文件",
+            initialdir=str(doc.path.parent),
+            initialfile=initial_name,
+            defaultextension=suffix,
+            filetypes=[config["filetype"]],
+            parent=self,
+        )
+        if not path:
+            return
+
+        # 强制使用所选格式的扩展名，避免界面选择与输出格式不一致。
+        target = Path(path)
+        if target.suffix.lower() not in config["suffixes"]:
+            target = target.with_suffix(suffix)
+        path = str(target)
+
+        try:
+            saved_path = save_image(doc.image, path, source_path=doc.path)
+        except ValidationError as exc:
+            messagebox.showerror("无法保存", str(exc), parent=self)
+            self._set_status("保存失败，请检查文件名和参数。", "error")
+            return
+        except ImageSaveError as exc:
+            messagebox.showerror("保存失败", str(exc), parent=self)
+            self._set_status("保存图片失败，请检查保存位置和权限。", "error")
+            return
+        except Exception as exc:
+            messagebox.showerror(
+                "保存失败", f"发生意外错误，图片未保存：\n{exc}", parent=self
+            )
+            self._set_status("保存图片时发生意外错误。", "error")
+            return
+
+        doc.mark_saved()
+        image_format = SUFFIX_FORMATS.get(saved_path.suffix.lower(), "")
+        self._set_status(f"已保存到：{saved_path}", "success")
+        messagebox.showinfo(
+            "保存成功",
+            "图片已另存为新文件：\n\n"
+            f"{saved_path}\n\n"
+            f"输出格式：{image_format}\n"
+            f"输出尺寸：{doc.image.width} × {doc.image.height} px\n\n"
+            "原图未被修改。",
+            parent=self,
+        )
+
+    def _on_close(self) -> None:
+        if not self._confirm_discard():
+            return
+        self.destroy()
 
     # ----- 预览 -----------------------------------------------------------
 
