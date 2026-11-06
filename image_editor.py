@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""图片信息与编辑器 —— 重写第 2 部分。
+"""图片信息与编辑器 —— 重写第 3 部分。
 
 本阶段实现：
     * 打开并校验图片，读取文件名、格式、宽高、颜色模式和文件大小；
     * 图片预览与基础错误提示；
-    * 等比/精确缩放；
-    * 顺时针 90°、180°、270° 旋转；
-    * 撤销与还原原图。
+    * 等比/精确缩放，90°、180°、270° 旋转，撤销与还原；
+    * 指定坐标裁剪、预览图拖动框选和越界提示；
+    * 彩色转灰度，并保留透明通道。
 
-裁剪、灰度和导出功能将在后续分支中补全。
+保存、格式转换和原图保护将在第 4 部分补全。
 
 运行：
     python image_editor.py
@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 import traceback
@@ -33,7 +34,7 @@ from tkinter import filedialog, messagebox, ttk
 
 APP_TITLE = "图片信息与编辑器"
 APP_VERSION = "1.0"
-PART_LABEL = "PART 2 / 4"
+PART_LABEL = "PART 3 / 4"
 
 OPEN_FILETYPES = [
     ("常见图片", "*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff *.gif"),
@@ -93,6 +94,10 @@ class ImageLoadError(ImageEditorError):
 
 class ValidationError(ImageEditorError):
     """用户输入的参数不合法。"""
+
+
+class CropOutOfBoundsError(ValidationError):
+    """裁剪区域超出图片边界。"""
 
 
 @dataclass(frozen=True)
@@ -272,6 +277,45 @@ def rotate_image(image: Image.Image, angle: int) -> Image.Image:
     return image.transpose(operations[angle])
 
 
+def crop_image(
+    image: Image.Image, x: int, y: int, width: int, height: int
+) -> Image.Image:
+    """裁剪指定矩形区域；越界时抛出明确的异常。"""
+    values = ((x, "X 坐标"), (y, "Y 坐标"), (width, "裁剪宽度"), (height, "裁剪高度"))
+    for value, name in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValidationError(f"{name}必须是整数。")
+    if x < 0 or y < 0:
+        raise ValidationError("裁剪坐标不能小于 0。")
+    if width <= 0 or height <= 0:
+        raise ValidationError("裁剪宽度和高度必须大于 0。")
+    if x + width > image.width or y + height > image.height:
+        raise CropOutOfBoundsError(
+            "裁剪区域超出图片范围。\n\n"
+            f"图片尺寸：{image.width} × {image.height} 像素\n"
+            f"当前区域：x={x}, y={y}, 宽={width}, 高={height}\n\n"
+            "请调整坐标或区域大小，确保区域完全位于图片内。"
+        )
+    return image.crop((x, y, x + width, y + height))
+
+
+def to_grayscale(image: Image.Image) -> Image.Image:
+    """转换灰度图；原图有透明通道时以 LA 模式保留透明度。"""
+    if image.mode in ("L", "LA"):
+        return image.copy()
+    if image.mode == "1":
+        return image.convert("L")
+    try:
+        if has_alpha(image):
+            rgba = image.convert("RGBA")
+            gray = rgba.convert("L")
+            alpha = rgba.getchannel("A")
+            return Image.merge("LA", (gray, alpha))
+        return ImageOps.grayscale(image)
+    except (OSError, ValueError) as exc:
+        raise ValidationError(f"无法转换为灰度图：{exc}") from exc
+
+
 class ImageDocument:
     """保存原图、当前编辑结果以及可撤销的历史状态。"""
 
@@ -364,7 +408,7 @@ def make_app_icon() -> Image.Image:
 
 
 class ImageEditorApp(tk.Tk):
-    """第 2 部分主窗口。"""
+    """第 3 部分主窗口。"""
 
     def __init__(self) -> None:
         super().__init__()
@@ -374,7 +418,10 @@ class ImageEditorApp(tk.Tk):
 
         self.document: ImageDocument | None = None
         self._preview_photo: ImageTk.PhotoImage | None = None
+        self._preview_geom: Tuple[int, int, int, int, float] | None = None
         self._render_job: str | None = None
+        self._crop_drag_start: Tuple[int, int] | None = None
+        self._crop_rect_id: int | None = None
 
         self._setup_fonts()
         self._setup_styles()
@@ -622,7 +669,7 @@ class ImageEditorApp(tk.Tk):
         ).pack(anchor="w")
         tk.Label(
             title_box,
-            text="阶段 2 · 图片信息、缩放与旋转",
+            text="阶段 3 · 裁剪、灰度与透明通道",
             bg=SURFACE,
             fg=MUTED,
             font=(self.font_family, 9),
@@ -699,10 +746,13 @@ class ImageEditorApp(tk.Tk):
         )
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self.canvas.bind("<ButtonPress-1>", self._on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
 
         tk.Label(
             card,
-            text="第 2 部分：已支持缩放与旋转；裁剪、灰度和导出将在后续合并中加入。",
+            text="第 3 部分：已支持缩放、旋转、裁剪与灰度；格式转换将在第 4 部分加入。",
             bg=SURFACE,
             fg="#94A3B8",
             font=(self.font_family, 9),
@@ -718,17 +768,17 @@ class ImageEditorApp(tk.Tk):
 
         self.info_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
         self.resize_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
+        self.crop_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
         self.rotate_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
-        self.progress_tab = tk.Frame(self.notebook, bg=SURFACE, padx=18, pady=16)
         self.notebook.add(self.info_tab, text="图片信息")
         self.notebook.add(self.resize_tab, text="缩放")
-        self.notebook.add(self.rotate_tab, text="旋转")
-        self.notebook.add(self.progress_tab, text="开发进度")
+        self.notebook.add(self.crop_tab, text="裁剪")
+        self.notebook.add(self.rotate_tab, text="旋转/灰度")
 
         self._build_info_tab()
         self._build_resize_tab()
+        self._build_crop_tab()
         self._build_rotate_tab()
-        self._build_progress_tab()
         self.notebook.select(self.info_tab)
 
     def _build_info_tab(self) -> None:
@@ -939,6 +989,120 @@ class ImageEditorApp(tk.Tk):
             "放大不会增加真实细节，建议避免过度放大。",
         )
 
+    def _entry_box(
+        self,
+        parent: tk.Widget,
+        title: str,
+        variable: tk.StringVar,
+        row: int,
+        column: int,
+    ) -> None:
+        box = tk.Frame(parent, bg=SURFACE)
+        box.grid(
+            row=row,
+            column=column,
+            sticky="ew",
+            padx=(0, 8) if column == 0 else 0,
+            pady=(0, 8),
+        )
+        box.grid_columnconfigure(0, weight=1)
+        tk.Label(
+            box,
+            text=title,
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 3))
+        ttk.Entry(box, textvariable=variable, width=9, justify="right").grid(
+            row=1, column=0, sticky="ew"
+        )
+
+    def _build_crop_tab(self) -> None:
+        tab = self.crop_tab
+        tk.Label(
+            tab,
+            text="指定区域裁剪",
+            bg=SURFACE,
+            fg=TEXT,
+            font=(self.font_family, 12, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            tab,
+            text="坐标从左上角 (0, 0) 开始。\n宽高单位为像素；也可直接在预览图上拖动框选。",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            justify="left",
+            wraplength=335,
+            anchor="w",
+        ).pack(fill="x", pady=(4, 8))
+
+        self.crop_current_var = tk.StringVar(value="当前图片：—")
+        tk.Label(
+            tab,
+            textvariable=self.crop_current_var,
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            anchor="w",
+        ).pack(fill="x", pady=(0, 7))
+
+        self.crop_x_var = tk.StringVar()
+        self.crop_y_var = tk.StringVar()
+        self.crop_w_var = tk.StringVar()
+        self.crop_h_var = tk.StringVar()
+
+        form = tk.Frame(tab, bg=SURFACE)
+        form.pack(fill="x")
+        form.grid_columnconfigure(0, weight=1)
+        form.grid_columnconfigure(1, weight=1)
+        self._entry_box(form, "X 坐标", self.crop_x_var, 0, 0)
+        self._entry_box(form, "Y 坐标", self.crop_y_var, 0, 1)
+        self._entry_box(form, "区域宽度", self.crop_w_var, 1, 0)
+        self._entry_box(form, "区域高度", self.crop_h_var, 1, 1)
+
+        self.crop_info_label = tk.Label(
+            tab,
+            text="选区：—",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            anchor="w",
+            justify="left",
+            wraplength=335,
+        )
+        self.crop_info_label.pack(fill="x", pady=(2, 8))
+        for var in (self.crop_x_var, self.crop_y_var, self.crop_w_var, self.crop_h_var):
+            var.trace_add("write", lambda *_: self._update_crop_hint())
+
+        button_row = tk.Frame(tab, bg=SURFACE)
+        button_row.pack(fill="x")
+        button_row.grid_columnconfigure(0, weight=1)
+        button_row.grid_columnconfigure(1, weight=1)
+        self.crop_btn = ttk.Button(
+            button_row,
+            text="应用裁剪",
+            style="Accent.TButton",
+            command=self._apply_crop,
+        )
+        self.crop_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.crop_all_btn = ttk.Button(
+            button_row,
+            text="全选图片",
+            style="Secondary.TButton",
+            command=self._select_full_crop,
+        )
+        self.crop_all_btn.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+        self._add_note_box(
+            tab,
+            "裁剪说明",
+            "区域必须完全位于图片内，否则会阻止裁剪并提示越界。\n"
+            "拖动框选后会自动切换到本页并填写坐标。",
+        )
+
     def _build_rotate_tab(self) -> None:
         tab = self.rotate_tab
         tk.Label(
@@ -991,11 +1155,39 @@ class ImageEditorApp(tk.Tk):
             )
             self.rotate_buttons.append(button)
 
+        ttk.Separator(tab, orient="horizontal").pack(fill="x", pady=(16, 13))
+        tk.Label(
+            tab,
+            text="色彩调整",
+            bg=SURFACE,
+            fg=TEXT,
+            font=(self.font_family, 11, "bold"),
+            anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            tab,
+            text="将彩色图片转换为灰度图；带透明通道的图片会保留透明度。",
+            bg=SURFACE,
+            fg=MUTED,
+            font=(self.font_family, 9),
+            justify="left",
+            wraplength=335,
+            anchor="w",
+        ).pack(fill="x", pady=(4, 9))
+
+        self.grayscale_btn = ttk.Button(
+            tab,
+            text="转换为灰度图",
+            style="Soft.TButton",
+            command=self._apply_grayscale,
+        )
+        self.grayscale_btn.pack(fill="x")
+
         self._add_note_box(
             tab,
-            "无损操作",
+            "处理说明",
             "旋转使用无损转置，不会重新采样或损失画质。\n"
-            "可随时点击“撤销”，或使用“还原原图”恢复到打开时的状态。",
+            "透明图片转灰度后以 LA 模式保留 alpha 通道，便于后续导出。",
         )
 
     def _add_note_box(self, parent: tk.Widget, title: str, text: str) -> None:
@@ -1018,81 +1210,6 @@ class ImageEditorApp(tk.Tk):
             justify="left",
             anchor="w",
             wraplength=315,
-        ).pack(fill="x", pady=(4, 0))
-
-    def _build_progress_tab(self) -> None:
-        tab = self.progress_tab
-        tk.Label(
-            tab,
-            text="重写进度",
-            bg=SURFACE,
-            fg=TEXT,
-            font=(self.font_family, 12, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-        tk.Label(
-            tab,
-            text=PART_LABEL,
-            bg=ACCENT_SOFT,
-            fg=ACCENT_DARK,
-            font=(self.font_family, 8, "bold"),
-            padx=8,
-            pady=2,
-            anchor="w",
-        ).pack(fill="x", pady=(6, 12))
-
-        items = [
-            ("已完成", "打开图片与错误处理", True),
-            ("已完成", "文件名 / 格式 / 宽高 / 颜色模式 / 大小", True),
-            ("已完成", "缩放、旋转、撤销与还原", True),
-            ("待实现", "裁剪、灰度与透明通道", False),
-            ("待实现", "格式转换、原图保护与完整测试", False),
-        ]
-        for status, text, done in items:
-            row = tk.Frame(tab, bg=SURFACE)
-            row.pack(fill="x", pady=5)
-            tk.Label(
-                row,
-                text="✓" if done else "○",
-                bg=SURFACE,
-                fg=SUCCESS if done else "#94A3B8",
-                font=(self.font_family, 10, "bold"),
-                width=2,
-                anchor="w",
-            ).pack(side="left")
-            tk.Label(
-                row,
-                text=text,
-                bg=SURFACE,
-                fg=TEXT if done else MUTED,
-                font=(self.font_family, 9),
-                anchor="w",
-                justify="left",
-                wraplength=275,
-            ).pack(side="left", fill="x", expand=True)
-
-        note = tk.Frame(tab, bg=SURFACE_ALT, padx=11, pady=9)
-        note.pack(fill="x", pady=(18, 0))
-        tk.Label(
-            note,
-            text="说明",
-            bg=SURFACE_ALT,
-            fg=ACCENT_DARK,
-            font=(self.font_family, 9, "bold"),
-            anchor="w",
-        ).pack(fill="x")
-        tk.Label(
-            note,
-            text=(
-                "这是重写计划的第 2 部分，已包含图片加载、缩放、旋转与撤销。\n"
-                "后续分支会补全裁剪、灰度、格式转换，最后通过 Git 合并。"
-            ),
-            bg=SURFACE_ALT,
-            fg=MUTED,
-            font=(self.font_family, 8),
-            justify="left",
-            anchor="w",
-            wraplength=310,
         ).pack(fill="x", pady=(4, 0))
 
     def _bind_shortcuts(self) -> None:
@@ -1128,11 +1245,13 @@ class ImageEditorApp(tk.Tk):
             self.info_state_var.set("未打开")
             self.info_state_badge.configure(bg=SURFACE_ALT, fg=MUTED)
             self.info_path_var.set("—")
-            self.info_note_var.set("打开图片后可进行等比缩放、精确缩放和旋转。")
+            self.info_note_var.set("打开图片后可进行缩放、旋转、裁剪和灰度转换。")
             self.preview_badge_var.set("未打开图片")
             self.resize_current_var.set("当前图片：—")
+            self.crop_current_var.set("当前图片：—")
             self.rotate_current_var.set("当前图片：—")
             self._update_resize_hint()
+            self._update_crop_hint()
             return
 
         info = doc.info
@@ -1158,13 +1277,21 @@ class ImageEditorApp(tk.Tk):
             f"{doc.action_label} · {image.width} × {image.height} px · {image.mode}"
         )
         self.resize_current_var.set(f"当前图片：{image.width} × {image.height} px")
+        self.crop_current_var.set(f"当前图片：{image.width} × {image.height} px")
         self.rotate_current_var.set(f"当前图片：{image.width} × {image.height} px")
         self._update_resize_hint()
+        self._update_crop_hint()
 
     def _refresh_action_states(self) -> None:
         doc = self.document
         state = "normal" if doc is not None else "disabled"
-        for button in (self.resize_btn, *self.rotate_buttons):
+        for button in (
+            self.resize_btn,
+            self.crop_btn,
+            self.crop_all_btn,
+            self.grayscale_btn,
+            *self.rotate_buttons,
+        ):
             button.configure(state=state)
         self.undo_btn.configure(
             state="normal" if doc is not None and doc.can_undo else "disabled"
@@ -1172,6 +1299,7 @@ class ImageEditorApp(tk.Tk):
         self.reset_btn.configure(
             state="normal" if doc is not None and doc.is_modified else "disabled"
         )
+        self.canvas.configure(cursor="crosshair" if doc is not None else "")
 
     def _update_resize_hint(self) -> None:
         if not hasattr(self, "resize_info_label"):
@@ -1199,10 +1327,53 @@ class ImageEditorApp(tk.Tk):
         except ValidationError as exc:
             self.resize_info_label.configure(text=str(exc), fg=DANGER)
 
+    def _update_crop_hint(self) -> None:
+        if not hasattr(self, "crop_info_label"):
+            return
+        doc = self.document
+        if doc is None:
+            self.crop_info_label.configure(text="选区：—", fg=MUTED)
+            return
+        try:
+            x = parse_nonnegative_int(self.crop_x_var.get(), "X 坐标")
+            y = parse_nonnegative_int(self.crop_y_var.get(), "Y 坐标")
+            width = parse_positive_int(self.crop_w_var.get(), "裁剪宽度")
+            height = parse_positive_int(self.crop_h_var.get(), "裁剪高度")
+        except ValidationError:
+            self.crop_info_label.configure(
+                text="选区：请输入完整的裁剪参数", fg=MUTED
+            )
+            return
+
+        if x + width > doc.image.width or y + height > doc.image.height:
+            self.crop_info_label.configure(
+                text="选区超出图片范围，请调整坐标或尺寸", fg=DANGER
+            )
+        else:
+            self.crop_info_label.configure(
+                text=f"选区：{width} × {height} px，右下角 ({x + width}, {y + height})",
+                fg=MUTED,
+            )
+
     def _reset_fields_for_document(self) -> None:
         self.resize_width_var.set("")
         self.resize_height_var.set("")
+        if self.document is not None:
+            width, height = self.document.image.size
+            self.crop_x_var.set("0")
+            self.crop_y_var.set("0")
+            self.crop_w_var.set(str(width))
+            self.crop_h_var.set(str(height))
+        else:
+            for variable in (
+                self.crop_x_var,
+                self.crop_y_var,
+                self.crop_w_var,
+                self.crop_h_var,
+            ):
+                variable.set("")
         self._update_resize_hint()
+        self._update_crop_hint()
 
     def _commit_edit(self, new_image: Image.Image, label: str, message: str) -> None:
         doc = self.document
@@ -1246,6 +1417,47 @@ class ImageEditorApp(tk.Tk):
             f"{new_image.width} × {new_image.height} 像素",
         )
 
+    def _apply_crop(self) -> None:
+        doc = self.document
+        if doc is None:
+            return
+        try:
+            x = parse_nonnegative_int(self.crop_x_var.get(), "X 坐标")
+            y = parse_nonnegative_int(self.crop_y_var.get(), "Y 坐标")
+            width = parse_positive_int(self.crop_w_var.get(), "裁剪宽度")
+            height = parse_positive_int(self.crop_h_var.get(), "裁剪高度")
+            old_width, old_height = doc.image.size
+            new_image = crop_image(doc.image, x, y, width, height)
+        except CropOutOfBoundsError as exc:
+            messagebox.showerror("裁剪区域越界", str(exc), parent=self)
+            self._set_status("裁剪区域超出图片范围，请重新设置。", "error")
+            return
+        except ValidationError as exc:
+            self._show_validation(exc)
+            return
+        except Exception as exc:
+            messagebox.showerror("裁剪失败", f"无法完成裁剪：\n{exc}", parent=self)
+            self._set_status("裁剪失败。", "error")
+            return
+
+        self._commit_edit(
+            new_image,
+            "区域裁剪",
+            f"裁剪完成：原图 {old_width} × {old_height}，"
+            f"新图 {new_image.width} × {new_image.height} 像素",
+        )
+
+    def _select_full_crop(self) -> None:
+        doc = self.document
+        if doc is None:
+            return
+        width, height = doc.image.size
+        self.crop_x_var.set("0")
+        self.crop_y_var.set("0")
+        self.crop_w_var.set(str(width))
+        self.crop_h_var.set(str(height))
+        self._set_status("已选中整张图片范围。")
+
     def _rotate(self, angle: int) -> None:
         doc = self.document
         if doc is None:
@@ -1266,6 +1478,32 @@ class ImageEditorApp(tk.Tk):
             f"旋转 {angle}°",
             f"旋转完成：{old_size[0]} × {old_size[1]} → "
             f"{new_image.width} × {new_image.height} 像素",
+        )
+
+    def _apply_grayscale(self) -> None:
+        doc = self.document
+        if doc is None:
+            return
+        if doc.image.mode in ("L", "LA"):
+            messagebox.showinfo("无需转换", "当前图片已经是灰度图。", parent=self)
+            self._set_status("当前图片已经是灰度图。")
+            return
+        try:
+            new_image = to_grayscale(doc.image)
+        except ValidationError as exc:
+            self._show_validation(exc)
+            return
+        except Exception as exc:
+            messagebox.showerror(
+                "转换失败", f"无法转换为灰度图：\n{exc}", parent=self
+            )
+            self._set_status("灰度转换失败。", "error")
+            return
+
+        self._commit_edit(
+            new_image,
+            "灰度转换",
+            f"已转换为灰度图，颜色模式：{describe_mode(new_image.mode)}",
         )
 
     def _on_undo(self) -> None:
@@ -1347,6 +1585,7 @@ class ImageEditorApp(tk.Tk):
     # ----- 预览 -----------------------------------------------------------
 
     def _on_canvas_configure(self, _event: tk.Event) -> None:
+        self._preview_geom = None
         if self._render_job is not None:
             try:
                 self.after_cancel(self._render_job)
@@ -1384,8 +1623,11 @@ class ImageEditorApp(tk.Tk):
 
     def _render_preview(self) -> None:
         self._render_job = None
+        self._crop_drag_start = None
+        self._crop_rect_id = None
         self.canvas.delete("all")
         self._preview_photo = None
+        self._preview_geom = None
 
         doc = self.document
         if doc is None:
@@ -1446,6 +1688,85 @@ class ImageEditorApp(tk.Tk):
             width=1,
         )
         self._preview_photo = photo
+        self._preview_geom = (x, y, display_w, display_h, display_w / image.width)
+
+    def _point_to_image(self, x: float, y: float) -> Tuple[float, float]:
+        if self._preview_geom is None:
+            raise ValidationError("预览尚未准备好。")
+        origin_x, origin_y, display_w, display_h, scale = self._preview_geom
+        x = min(max(x, origin_x), origin_x + display_w)
+        y = min(max(y, origin_y), origin_y + display_h)
+        return (x - origin_x) / scale, (y - origin_y) / scale
+
+    def _on_canvas_press(self, event: tk.Event) -> None:
+        if self.document is None or self._preview_geom is None:
+            return
+        origin_x, origin_y, display_w, display_h, _ = self._preview_geom
+        if not (
+            origin_x <= event.x <= origin_x + display_w
+            and origin_y <= event.y <= origin_y + display_h
+        ):
+            return
+        self._crop_drag_start = (event.x, event.y)
+        if self._crop_rect_id is not None:
+            self.canvas.delete(self._crop_rect_id)
+        self._crop_rect_id = self.canvas.create_rectangle(
+            event.x,
+            event.y,
+            event.x,
+            event.y,
+            outline="#38BDF8",
+            width=2,
+            dash=(5, 3),
+        )
+
+    def _on_canvas_drag(self, event: tk.Event) -> None:
+        if self._crop_drag_start is None or self._crop_rect_id is None:
+            return
+        if self._preview_geom is None:
+            return
+        origin_x, origin_y, display_w, display_h, _ = self._preview_geom
+        start_x, start_y = self._crop_drag_start
+        current_x = min(max(event.x, origin_x), origin_x + display_w)
+        current_y = min(max(event.y, origin_y), origin_y + display_h)
+        self.canvas.coords(
+            self._crop_rect_id, start_x, start_y, current_x, current_y
+        )
+
+    def _on_canvas_release(self, event: tk.Event) -> None:
+        if self._crop_drag_start is None or self._crop_rect_id is None:
+            return
+        start_x, start_y = self._crop_drag_start
+        end_x, end_y = event.x, event.y
+        self._crop_drag_start = None
+
+        if abs(end_x - start_x) < 3 or abs(end_y - start_y) < 3:
+            self.canvas.delete(self._crop_rect_id)
+            self._crop_rect_id = None
+            return
+        if self._preview_geom is None or self.document is None:
+            return
+
+        left_canvas, right_canvas = sorted((start_x, end_x))
+        top_canvas, bottom_canvas = sorted((start_y, end_y))
+        left_f, top_f = self._point_to_image(left_canvas, top_canvas)
+        right_f, bottom_f = self._point_to_image(right_canvas, bottom_canvas)
+
+        image_width, image_height = self.document.image.size
+        left = max(0, min(image_width - 1, int(math.floor(left_f))))
+        top = max(0, min(image_height - 1, int(math.floor(top_f))))
+        right = max(left + 1, min(image_width, int(math.ceil(right_f))))
+        bottom = max(top + 1, min(image_height, int(math.ceil(bottom_f))))
+
+        self.crop_x_var.set(str(left))
+        self.crop_y_var.set(str(top))
+        self.crop_w_var.set(str(right - left))
+        self.crop_h_var.set(str(bottom - top))
+        self.notebook.select(self.crop_tab)
+        self._set_status(
+            f"已框选区域：x={left}, y={top}, 宽={right - left}, 高={bottom - top}。"
+            "确认后点击“应用裁剪”。"
+        )
 
 
 def main() -> None:
